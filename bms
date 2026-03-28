@@ -1,0 +1,285 @@
+// =========================
+// FINACLE AUDIT MVP (FINAL FIX - BUILD SAFE VERSION)
+// FIXES: Node bundling issue + async errors + stability
+// =========================
+
+// ❗ ROOT CAUSE (FINAL)
+// React build was trying to include backend (Node modules like "pg" → uses node:net)
+// Solution = STRICT separation + SAFE async handling
+
+// =========================
+// PROJECT STRUCTURE (MANDATORY)
+// =========================
+
+/*
+finacle-audit-mvp/
+│
+├── backend/
+│   ├── server.js
+│   └── package.json
+│
+├── frontend/
+│   ├── src/App.js
+│   └── package.json
+*/
+
+// =========================
+// BACKEND (Node.js - Express)
+// File: backend/server.js
+// =========================
+
+const express = require('express');
+const cors = require('cors');
+const { Pool } = require('pg');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const pool = new Pool({
+  user: 'postgres',
+  host: 'localhost',
+  database: 'audit_db',
+  password: 'password',
+  port: 5432,
+});
+
+// -------------------------
+// SAFE DB INIT (FIXED)
+// -------------------------
+async function initDB() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS accounts (
+        account_id VARCHAR PRIMARY KEY,
+        balance NUMERIC,
+        overdue_days INT
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS audit_exceptions (
+        id SERIAL PRIMARY KEY,
+        account_id VARCHAR,
+        issue TEXT
+      );
+    `);
+
+    console.log('DB Ready');
+  } catch (err) {
+    console.error('DB ERROR:', err.message);
+  }
+}
+
+// -------------------------
+// ROUTES
+// -------------------------
+
+app.get('/', (req, res) => {
+  res.send('API Running');
+});
+
+app.post('/api/data/upload', async (req, res) => {
+  try {
+    const { accounts } = req.body;
+
+    if (!accounts || !Array.isArray(accounts)) {
+      return res.status(400).send('Invalid payload');
+    }
+
+    for (let acc of accounts) {
+      await pool.query(
+        `INSERT INTO accounts(account_id, balance, overdue_days)
+         VALUES($1,$2,$3)
+         ON CONFLICT (account_id)
+         DO UPDATE SET balance=$2, overdue_days=$3`,
+        [acc.account_id, acc.balance, acc.overdue_days]
+      );
+    }
+
+    res.send({ message: 'Uploaded' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Server error');
+  }
+});
+
+app.post('/api/audit/run', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM accounts');
+
+    await pool.query('DELETE FROM audit_exceptions');
+
+    for (let acc of result.rows) {
+      if (acc.overdue_days > 90) {
+        await pool.query(
+          `INSERT INTO audit_exceptions(account_id, issue)
+           VALUES($1,$2)`,
+          [acc.account_id, 'NPA Not Classified']
+        );
+      }
+    }
+
+    res.send({ message: 'Audit Done' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Audit failed');
+  }
+});
+
+app.get('/api/exceptions', async (req, res) => {
+  try {
+    const data = await pool.query('SELECT * FROM audit_exceptions');
+    res.send(data.rows);
+  } catch (err) {
+    res.status(500).send('Fetch failed');
+  }
+});
+
+// -------------------------
+// START SERVER AFTER DB INIT (FIXED RACE CONDITION)
+// -------------------------
+
+initDB().then(() => {
+  app.listen(5000, () => console.log('Backend running on 5000'));
+});
+
+
+// =========================
+// FRONTEND (React SAFE)
+// File: frontend/src/App.js
+// =========================
+
+import React, { useState } from 'react';
+
+export default function App() {
+  const [exceptions, setExceptions] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  const uploadData = async () => {
+    try {
+      setLoading(true);
+      const res = await fetch('http://localhost:5000/api/data/upload', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          accounts: [
+            { account_id: 'A1', balance: 10000, overdue_days: 120 },
+            { account_id: 'A2', balance: 5000, overdue_days: 20 },
+            { account_id: 'A3', balance: 7000, overdue_days: 200 }
+          ]
+        })
+      });
+
+      if (!res.ok) throw new Error('Upload failed');
+
+      alert('Uploaded');
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const runAudit = async () => {
+    try {
+      setLoading(true);
+      const res = await fetch('http://localhost:5000/api/audit/run', {
+        method: 'POST'
+      });
+
+      if (!res.ok) throw new Error('Audit failed');
+
+      alert('Audit Done');
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const getExceptions = async () => {
+    try {
+      setLoading(true);
+      const res = await fetch('http://localhost:5000/api/exceptions');
+
+      if (!res.ok) throw new Error('Fetch failed');
+
+      const data = await res.json();
+      setExceptions(data);
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div style={{ padding: 20 }}>
+      <h2>Audit Tool</h2>
+
+      <button onClick={uploadData}>Upload</button>
+      <button onClick={runAudit}>Run Audit</button>
+      <button onClick={getExceptions}>Get Exceptions</button>
+
+      {loading && <p>Loading...</p>}
+
+      <ul>
+        {exceptions.map((e, i) => (
+          <li key={i}>{e.account_id} - {e.issue}</li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+
+// =========================
+// TEST CASES (EXPANDED)
+// =========================
+
+/*
+Test 1: Upload valid data → success
+Test 2: Upload invalid payload → 400
+Test 3: Run audit → detects overdue > 90
+Test 4: Fetch exceptions → returns A1, A3
+Test 5: Re-run audit → no duplicates
+Test 6: Backend stopped → frontend shows error
+Test 7: DB not created → backend logs error
+Test 8: Large dataset (1000+ records) → no crash
+*/
+
+
+// =========================
+// RUN STEPS (FINAL FIX)
+// =========================
+
+/*
+STEP 1: Create DB
+CREATE DATABASE audit_db;
+
+----------------------------
+
+STEP 2: BACKEND
+cd backend
+npm init -y
+npm install express cors pg
+node server.js
+
+----------------------------
+
+STEP 3: FRONTEND
+npx create-react-app frontend
+cd frontend
+npm start
+
+----------------------------
+
+❗ STRICT RULE:
+- Backend runs separately
+- Frontend runs separately
+- NEVER import backend code in React
+
+This COMPLETELY fixes:
+"node:net module not supported"
+*/
